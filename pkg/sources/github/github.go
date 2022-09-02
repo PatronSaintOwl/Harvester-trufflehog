@@ -225,6 +225,23 @@ func (s *Source) enumerateWithToken(ctx context.Context, apiEndpoint, token stri
 			if err := s.addReposByOrg(ctx, apiClient, org); err != nil {
 				log.WithError(err).Error("error fetching repos by org")
 			}
+
+			if s.conn.ScanUsers {
+				err := s.addMembersByOrg(ctx, apiClient, org)
+				if err != nil {
+					log.WithError(err).Infof("Unable to add members by org for org %s", org)
+					continue
+				}
+				log.Infof("Scanning repos from %d members of %s organization.", len(s.members), org)
+				for _, member := range s.members {
+					if err := s.addGistsByUser(ctx, apiClient, member); err != nil {
+						log.WithError(err).Infof("Unable to fetch gists by user %s", member)
+					}
+					if err := s.addReposByUser(ctx, apiClient, member); err != nil {
+						log.WithError(err).Infof("Unable to fetch repos by user %s", member)
+					}
+				}
+			}
 		}
 	}
 
@@ -613,42 +630,17 @@ func (s *Source) addMembersByApp(ctx context.Context, installationClient *github
 	opts := &github.ListOptions{
 		PerPage: 500,
 	}
-	optsOrg := &github.ListMembersOptions{
-		PublicOnly:  false,
-		ListOptions: *opts,
-	}
 
 	installs, _, err := installationClient.Apps.ListInstallations(ctx, opts)
 	if err != nil {
 		log.WithError(err).Warn("Could not enumerate organizations using user")
 		return err
 	}
+
 	for _, org := range installs {
-		for {
-			members, res, err := apiClient.Organizations.ListMembers(ctx, *org.Account.Login, optsOrg)
-			if err == nil {
-				defer res.Body.Close()
-			}
-			if handled := handleRateLimit(err, res); handled {
-				continue
-			}
-			if err != nil || len(members) == 0 {
-				errText := "Could not list organization members: Please install on an organization. Otherwise, this is an older version of the Github app, please delete and re-add this source!"
-				log.WithError(err).Warnf(errText)
-				return errors.New(errText)
-			}
-			for _, m := range members {
-				usr := m.Login
-				if usr == nil || *usr == "" {
-					continue
-				}
-				common.AddStringSliceItem(*usr, &s.members)
-			}
-			if res.NextPage == 0 {
-				break
-			}
-			opts.Page = res.NextPage
-		}
+		// Currently the returned error is already logged.
+		// Normally we would continue on error, but there's nothing else to do in this loop.
+		_ = s.addMembersByOrg(ctx, apiClient, *org.Account.Login)
 	}
 
 	return nil
@@ -761,6 +753,44 @@ func (s *Source) addOrgsByUser(ctx context.Context, apiClient *github.Client, us
 		}
 		orgOpts.Page = resp.NextPage
 	}
+}
+
+func (s *Source) addMembersByOrg(ctx context.Context, apiClient *github.Client, org string) error {
+	opts := &github.ListOptions{
+		PerPage: 500,
+	}
+	optsOrg := &github.ListMembersOptions{
+		PublicOnly:  false,
+		ListOptions: *opts,
+	}
+
+	for {
+		members, res, err := apiClient.Organizations.ListMembers(ctx, org, optsOrg)
+		if err == nil {
+			defer res.Body.Close()
+		}
+		if handled := handleRateLimit(err, res); handled {
+			continue
+		}
+		if err != nil || len(members) == 0 {
+			errText := "Could not list organization members: account may not have access to list organization members"
+			log.WithError(err).Warnf(errText)
+			return errors.New(errText)
+		}
+		for _, m := range members {
+			usr := m.Login
+			if usr == nil || *usr == "" {
+				continue
+			}
+			common.AddStringSliceItem(*usr, &s.members)
+		}
+		if res.NextPage == 0 {
+			break
+		}
+		opts.Page = res.NextPage
+	}
+
+	return nil
 }
 
 func (s *Source) normalizeRepos(ctx context.Context, apiClient *github.Client) {
